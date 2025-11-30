@@ -1,8 +1,13 @@
 import sys
 import numpy as np
-import librosa
 import soundfile as sf
 from scipy.signal import hilbert
+
+# ✅ librosa imports mínimos (evita importar librosa completo y su dependencia sklearn)
+from librosa.core.audio import load as lr_load, resample as lr_resample
+from librosa.core.pitch import pyin as lr_pyin
+from librosa.core.convert import note_to_hz as lr_note_to_hz, hz_to_midi as lr_hz_to_midi
+from librosa.effects import pitch_shift as lr_pitch_shift
 
 from PySide6.QtCore import QObject, QThread, Signal, Qt
 from PySide6.QtWidgets import (
@@ -38,7 +43,7 @@ FMAX_NOTE = "C7"
 
 def load_mono(path: str):
     """Carga un audio en mono, sin cambiar el samplerate."""
-    y, sr = librosa.load(path, sr=None, mono=True)
+    y, sr = lr_load(path, sr=None, mono=True)
     return y, sr
 
 
@@ -89,15 +94,15 @@ def extract_midi_curve(y: np.ndarray, sr: int, hop_length: int = HOP_LENGTH) -> 
     Rellena huecos (NaN) con la última nota válida.
     Si no se detecta ningún pitch, lanza una excepción.
     """
-    f0, voiced_flag, voiced_prob = librosa.pyin(
+    f0, voiced_flag, voiced_prob = lr_pyin(
         y,
-        fmin=librosa.note_to_hz(FMIN_NOTE),
-        fmax=librosa.note_to_hz(FMAX_NOTE),
+        fmin=lr_note_to_hz(FMIN_NOTE),
+        fmax=lr_note_to_hz(FMAX_NOTE),
         frame_length=2048,
         hop_length=hop_length,
     )
 
-    midi = librosa.hz_to_midi(f0)  # puede contener NaN
+    midi = lr_hz_to_midi(f0)  # puede contener NaN
     midi_clean = np.array(midi, dtype=float)
 
     valid_idx = np.where(~np.isnan(midi_clean))[0]
@@ -147,7 +152,7 @@ def time_varying_pitch_shift(
         frame = y[start:end]
 
         # pitch-shift de la ventanita
-        shifted = librosa.effects.pitch_shift(frame, sr=sr, n_steps=float(semitones))
+        shifted = lr_pitch_shift(frame, sr=sr, n_steps=float(semitones))
 
         # aseguramos longitud frame_len
         if len(shifted) > frame_len:
@@ -156,7 +161,6 @@ def time_varying_pitch_shift(
             shifted = np.pad(shifted, (0, frame_len - len(shifted)))
 
         shifted *= win
-
         out[start:end] += shifted
 
     max_abs = np.max(np.abs(out))
@@ -230,7 +234,7 @@ class AudioWorker(QObject):
                     f"Samplerates distintos (fuente={sr_src}, molde={sr_dst}). "
                     "Remuestreando molde al de la fuente..."
                 )
-                dst = librosa.resample(dst, orig_sr=sr_dst, target_sr=sr_src)
+                dst = lr_resample(dst, orig_sr=sr_dst, target_sr=sr_src)
                 sr_dst = sr_src
                 self.log.emit(f"  Nuevo molde: {len(dst)} muestras, sr = {sr_dst} Hz")
 
