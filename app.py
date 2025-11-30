@@ -3,11 +3,14 @@ import numpy as np
 import soundfile as sf
 from scipy.signal import hilbert
 
-# ✅ librosa imports mínimos (evita importar librosa completo y su dependencia sklearn)
+# ✅ librosa imports mínimos (sin importar librosa completo)
 from librosa.core.audio import load as lr_load, resample as lr_resample
 from librosa.core.pitch import pyin as lr_pyin
 from librosa.core.convert import note_to_hz as lr_note_to_hz, hz_to_midi as lr_hz_to_midi
-from librosa.effects import pitch_shift as lr_pitch_shift
+
+# ✅ para pitch shift sin librosa.effects (evita dependencia sklearn)
+from librosa.core.spectrum import stft as lr_stft, istft as lr_istft, phase_vocoder as lr_phase_vocoder
+from librosa.util import fix_length as lr_fix_length
 
 from PySide6.QtCore import QObject, QThread, Signal, Qt
 from PySide6.QtWidgets import (
@@ -48,10 +51,7 @@ def load_mono(path: str):
 
 
 def compute_envelope(signal: np.ndarray) -> np.ndarray:
-    """
-    Calcula la envolvente por transformada de Hilbert.
-    Devuelve un array positivo del mismo tamaño.
-    """
+    """Envolvente por Hilbert."""
     analytic = hilbert(signal)
     env = np.abs(analytic)
     return env
@@ -70,29 +70,19 @@ def apply_envelope(dst: np.ndarray, env: np.ndarray, safety_gain: float = 0.5) -
     dst_seg = dst[:min_len]
     env_seg = env[:min_len]
 
-    # Normalizar envolvente a [0,1]
     max_env = np.max(env_seg)
-    if max_env > 0:
-        env_norm = env_seg / max_env
-    else:
-        env_norm = env_seg
+    env_norm = (env_seg / max_env) if max_env > 0 else env_seg
 
-    # Bajar un poco el destino para evitar clipping
     dst_scaled = dst_seg * safety_gain
-
-    # Aplicar envolvente
     out = dst_scaled * env_norm
-
-    # Limitar a [-1, 1] por seguridad
     out = np.clip(out, -1.0, 1.0)
     return out
 
 
 def extract_midi_curve(y: np.ndarray, sr: int, hop_length: int = HOP_LENGTH) -> np.ndarray:
     """
-    Extrae curva de pitch en notas MIDI usando librosa.pyin.
-    Rellena huecos (NaN) con la última nota válida.
-    Si no se detecta ningún pitch, lanza una excepción.
+    Extrae curva de pitch en notas MIDI usando pyin.
+    Rellena NaNs con la última nota válida.
     """
     f0, voiced_flag, voiced_prob = lr_pyin(
         y,
@@ -112,7 +102,6 @@ def extract_midi_curve(y: np.ndarray, sr: int, hop_length: int = HOP_LENGTH) -> 
             "(demasiado ruidoso, polifónico o volumen muy bajo)."
         )
 
-    # Rellenar NaNs con la última nota válida
     last = midi_clean[valid_idx[0]]
     for i in range(len(midi_clean)):
         if np.isnan(midi_clean[i]):
@@ -123,6 +112,31 @@ def extract_midi_curve(y: np.ndarray, sr: int, hop_length: int = HOP_LENGTH) -> 
     return midi_clean
 
 
+def lr_pitch_shift(y: np.ndarray, sr: int, n_steps: float, hop_length: int = HOP_LENGTH) -> np.ndarray:
+    """
+    Pitch shift SIN librosa.effects (evita sklearn).
+    Método: resample (cambia pitch + duración) + phase vocoder (corrige duración).
+    """
+    if n_steps == 0:
+        return y
+
+    rate = 2.0 ** (n_steps / 12.0)  # factor de pitch
+
+    # 1) Acelerar (sube pitch) cambiando el "sr efectivo" vía resample a sr/rate
+    target_sr = max(1, int(round(sr / rate)))
+    y_fast = lr_resample(y, orig_sr=sr, target_sr=target_sr)
+
+    # 2) Volver a la duración original sin cambiar pitch usando phase vocoder
+    D = lr_stft(y_fast, hop_length=hop_length)
+    # phase_vocoder rate > 1 acelera; para alargar (desacelerar) usamos 1/rate
+    D_stretch = lr_phase_vocoder(D, rate=1.0 / rate, hop_length=hop_length)
+    y_out = lr_istft(D_stretch, hop_length=hop_length)
+
+    # 3) Ajustar longitud final para que coincida con el input
+    y_out = lr_fix_length(y_out, size=len(y))
+    return y_out
+
+
 def time_varying_pitch_shift(
     y: np.ndarray,
     sr: int,
@@ -131,14 +145,10 @@ def time_varying_pitch_shift(
     hop_length: int = HOP_LENGTH,
 ) -> np.ndarray:
     """
-    Pitch-shift tiempo-variable usando una curva de notas MIDI.
-
-    - y: audio molde (en C originalmente)
-    - midi_curve: curva de notas MIDI del audio fuente
-    - base_midi: nota base del molde (C4 = 60)
+    Pitch-shift tiempo-variable usando una curva MIDI.
     """
     offsets = midi_curve - base_midi  # semitonos
-    frame_len = hop_length * 4       # ventana para overlap-add
+    frame_len = hop_length * 4
     win = np.hanning(frame_len)
 
     out = np.zeros_like(y, dtype=float)
@@ -150,11 +160,8 @@ def time_varying_pitch_shift(
             break
 
         frame = y[start:end]
+        shifted = lr_pitch_shift(frame, sr=sr, n_steps=float(semitones), hop_length=hop_length)
 
-        # pitch-shift de la ventanita
-        shifted = lr_pitch_shift(frame, sr=sr, n_steps=float(semitones))
-
-        # aseguramos longitud frame_len
         if len(shifted) > frame_len:
             shifted = shifted[:frame_len]
         elif len(shifted) < frame_len:
@@ -201,11 +208,11 @@ class PitchPlotCanvas(FigureCanvas):
 
 
 class AudioWorker(QObject):
-    progress = Signal(int)      # 0-100
+    progress = Signal(int)
     log = Signal(str)
     finished = Signal()
     error = Signal(str)
-    pitch_curve = Signal(object)  # np.ndarray para dibujar curva
+    pitch_curve = Signal(object)
 
     def __init__(self, src_path: str, dst_path: str, out_path: str):
         super().__init__()
@@ -217,7 +224,6 @@ class AudioWorker(QObject):
         try:
             self.log.emit("Iniciando proceso: afinación + envolvente")
 
-            # 1) Cargar audios
             self.log.emit("Cargando audio fuente...")
             self.progress.emit(5)
             src, sr_src = load_mono(self.src_path)
@@ -228,7 +234,6 @@ class AudioWorker(QObject):
             dst, sr_dst = load_mono(self.dst_path)
             self.log.emit(f"  Molde: {len(dst)} muestras, sr = {sr_dst} Hz")
 
-            # 2) Igualar samplerate
             if sr_src != sr_dst:
                 self.log.emit(
                     f"Samplerates distintos (fuente={sr_src}, molde={sr_dst}). "
@@ -238,7 +243,6 @@ class AudioWorker(QObject):
                 sr_dst = sr_src
                 self.log.emit(f"  Nuevo molde: {len(dst)} muestras, sr = {sr_dst} Hz")
 
-            # 3) Hacer que la duración la marque la fuente
             min_len = min(len(src), len(dst))
             if min_len < len(dst):
                 self.log.emit(
@@ -248,35 +252,29 @@ class AudioWorker(QObject):
             src = src[:min_len]
             dst = dst[:min_len]
 
-            # 4) Envolvente de la fuente
             self.log.emit("Calculando envolvente de la fuente (Hilbert)...")
             self.progress.emit(30)
             env = compute_envelope(src)
 
-            # 5) Curva de pitch del fuente
             self.log.emit("Extrayendo curva de pitch (pyin)...")
             self.progress.emit(50)
             midi_curve = extract_midi_curve(src, sr_src, hop_length=HOP_LENGTH)
             self.pitch_curve.emit(midi_curve)
+
             mean_midi = float(np.mean(midi_curve))
             std_midi = float(np.std(midi_curve))
-            self.log.emit(
-                f"Curva de pitch: media = {mean_midi:.2f} MIDI, desviación = {std_midi:.2f}"
-            )
+            self.log.emit(f"Curva de pitch: media = {mean_midi:.2f} MIDI, desviación = {std_midi:.2f}")
 
-            # 6) Aplicar curva de pitch al molde
             self.log.emit("Aplicando curva de pitch al molde...")
             self.progress.emit(70)
             pitched = time_varying_pitch_shift(
                 dst, sr_src, midi_curve, base_midi=BASE_MIDI, hop_length=HOP_LENGTH
             )
 
-            # 7) Aplicar envolvente de la fuente al audio ya afinado
             self.log.emit("Aplicando envolvente de la fuente al molde afinado...")
             self.progress.emit(85)
             out = apply_envelope(pitched, env, safety_gain=0.5)
 
-            # 8) Guardar resultado
             self.log.emit(f"Guardando resultado en: {self.out_path}")
             self.progress.emit(95)
             sf.write(self.out_path, out, sr_src)
@@ -306,11 +304,9 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(15, 15, 15, 15)
         main_layout.setSpacing(10)
 
-        # --- Texto de modo ---
         mode_label = QLabel("Modo: Copiar afinación (portamento) + envolvente en un solo paso")
         main_layout.addWidget(mode_label)
 
-        # --- Rutas de archivos ---
         self.src_edit = QLineEdit()
         self.dst_edit = QLineEdit()
         self.out_edit = QLineEdit()
@@ -323,19 +319,16 @@ class MainWindow(QMainWindow):
         btn_dst.clicked.connect(self.browse_dst)
         btn_out.clicked.connect(self.browse_out)
 
-        # Fila fuente
         row_src = QHBoxLayout()
         row_src.addWidget(QLabel("Audio fuente:"))
         row_src.addWidget(self.src_edit)
         row_src.addWidget(btn_src)
 
-        # Fila molde
         row_dst = QHBoxLayout()
         row_dst.addWidget(QLabel("Audio molde (en C):"))
         row_dst.addWidget(self.dst_edit)
         row_dst.addWidget(btn_dst)
 
-        # Fila salida
         row_out = QHBoxLayout()
         row_out.addWidget(QLabel("Audio de salida:"))
         row_out.addWidget(self.out_edit)
@@ -345,38 +338,30 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(row_dst)
         main_layout.addLayout(row_out)
 
-        # --- Botón procesar ---
         self.process_button = QPushButton("Procesar (afinación + envolvente)")
         self.process_button.clicked.connect(self.start_processing)
         main_layout.addWidget(self.process_button)
 
-        # --- Barra de progreso ---
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         main_layout.addWidget(self.progress_bar)
 
-        # --- Plot de pitch ---
         self.pitch_canvas = PitchPlotCanvas(self)
         main_layout.addWidget(self.pitch_canvas)
 
-        # --- Logs ---
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         main_layout.addWidget(self.log_text, stretch=1)
 
-        # Spacer + copyright
         main_layout.addItem(QSpacerItem(0, 10, QSizePolicy.Minimum, QSizePolicy.Expanding))
 
         self.footer_label = QLabel("© 2025 Gabriel Golker")
         self.footer_label.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(self.footer_label)
 
-        # Hilo y worker
         self.thread = None
         self.worker = None
-
-    # ---------- Métodos de browse ----------
 
     def browse_src(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -408,8 +393,6 @@ class MainWindow(QMainWindow):
         if path:
             self.out_edit.setText(path)
 
-    # ---------- Procesamiento ----------
-
     def start_processing(self):
         src_path = self.src_edit.text().strip()
         dst_path = self.dst_edit.text().strip()
@@ -429,7 +412,6 @@ class MainWindow(QMainWindow):
         self.worker = AudioWorker(src_path, dst_path, out_path)
         self.worker.moveToThread(self.thread)
 
-        # Conexiones
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log.connect(self.append_log)
@@ -437,7 +419,6 @@ class MainWindow(QMainWindow):
         self.worker.error.connect(self.on_error)
         self.worker.pitch_curve.connect(self.on_pitch_curve)
 
-        # Limpieza de hilo
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
@@ -463,15 +444,10 @@ class MainWindow(QMainWindow):
         self.pitch_canvas.plot_curve(np.array(midi_curve))
 
 
-# ----------------- ENTRADA PRINCIPAL -----------------
-
-
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
-    # QDarkStyle
     import qdarkstyle
-
     app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api="pyside6"))
 
     window = MainWindow()
