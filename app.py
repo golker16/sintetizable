@@ -1,16 +1,11 @@
 import sys
 import numpy as np
 import soundfile as sf
-from scipy.signal import hilbert
 
-# ✅ librosa imports mínimos (sin importar librosa completo)
-from librosa.core.audio import load as lr_load, resample as lr_resample
+# librosa imports mínimos (sin importar librosa “entero”)
+from librosa.core.audio import load as lr_load
 from librosa.core.pitch import pyin as lr_pyin
 from librosa.core.convert import note_to_hz as lr_note_to_hz, hz_to_midi as lr_hz_to_midi
-
-# ✅ para pitch shift sin librosa.effects (evita dependencia sklearn)
-from librosa.core.spectrum import stft as lr_stft, istft as lr_istft, phase_vocoder as lr_phase_vocoder
-from librosa.util import fix_length as lr_fix_length
 
 from PySide6.QtCore import QObject, QThread, Signal, Qt
 from PySide6.QtWidgets import (
@@ -28,157 +23,160 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QSpacerItem,
     QSizePolicy,
+    QComboBox,
+    QSpinBox,
+    QDoubleSpinBox,
+    QCheckBox,
 )
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-# ----------------- CONSTANTES GLOBALES -----------------
 
-HOP_LENGTH = 256        # hop para análisis de pitch
-BASE_MIDI = 60.0        # C4 como referencia del molde
+# ----------------- DEFAULTS -----------------
+
 FMIN_NOTE = "C2"
 FMAX_NOTE = "C7"
+DEFAULT_FRAME_LENGTH = 2048
+DEFAULT_HOP_LENGTH = 256
 
 
-# ----------------- UTILIDADES DE AUDIO -----------------
-
+# ----------------- DSP -----------------
 
 def load_mono(path: str):
-    """Carga un audio en mono, sin cambiar el samplerate."""
     y, sr = lr_load(path, sr=None, mono=True)
-    return y, sr
+    return y.astype(np.float32, copy=False), int(sr)
 
 
-def compute_envelope(signal: np.ndarray) -> np.ndarray:
-    """Envolvente por Hilbert."""
-    analytic = hilbert(signal)
-    env = np.abs(analytic)
-    return env
+def frame_rms(y: np.ndarray, frame_length: int, hop_length: int) -> np.ndarray:
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    if n < frame_length:
+        y = np.pad(y, (0, frame_length - n))
+        n = len(y)
+
+    n_frames = 1 + (n - frame_length) // hop_length
+    rms = np.empty(n_frames, dtype=float)
+
+    for i in range(n_frames):
+        start = i * hop_length
+        frame = y[start:start + frame_length]
+        rms[i] = np.sqrt(np.mean(frame * frame) + 1e-12)
+
+    return rms
 
 
-def apply_envelope(dst: np.ndarray, env: np.ndarray, safety_gain: float = 0.5) -> np.ndarray:
-    """
-    Aplica la envolvente al audio destino YA AFINADO.
-
-    - Si el destino es más largo que la envolvente,
-      SOLO se usan los primeros len(env) samples.
-    - Si la envolvente es más larga, se recorta al tamaño del destino.
-    """
-    min_len = min(len(dst), len(env))
-
-    dst_seg = dst[:min_len]
-    env_seg = env[:min_len]
-
-    max_env = np.max(env_seg)
-    env_norm = (env_seg / max_env) if max_env > 0 else env_seg
-
-    dst_scaled = dst_seg * safety_gain
-    out = dst_scaled * env_norm
-    out = np.clip(out, -1.0, 1.0)
-    return out
+def one_pole_smooth(x: np.ndarray, alpha: float) -> np.ndarray:
+    alpha = float(np.clip(alpha, 1e-6, 1.0))
+    y = np.empty_like(x, dtype=float)
+    y[0] = x[0]
+    for i in range(1, len(x)):
+        y[i] = alpha * x[i] + (1.0 - alpha) * y[i - 1]
+    return y
 
 
-def extract_midi_curve(y: np.ndarray, sr: int, hop_length: int = HOP_LENGTH) -> np.ndarray:
-    """
-    Extrae curva de pitch en notas MIDI usando pyin.
-    Rellena NaNs con la última nota válida.
-    """
+def extract_pitch_voicing_and_env(
+    y: np.ndarray,
+    sr: int,
+    frame_length: int,
+    hop_length: int,
+    env_smooth_alpha: float,
+    f0_smooth_alpha: float,
+    gate_unvoiced: bool,
+):
+    # Pitch tracking
     f0, voiced_flag, voiced_prob = lr_pyin(
         y,
         fmin=lr_note_to_hz(FMIN_NOTE),
         fmax=lr_note_to_hz(FMAX_NOTE),
-        frame_length=2048,
+        frame_length=frame_length,
         hop_length=hop_length,
     )
 
-    midi = lr_hz_to_midi(f0)  # puede contener NaN
-    midi_clean = np.array(midi, dtype=float)
+    f0 = np.asarray(f0, dtype=float)
+    voiced = np.asarray(voiced_flag, dtype=bool)
 
-    valid_idx = np.where(~np.isnan(midi_clean))[0]
-    if len(valid_idx) == 0:
-        raise RuntimeError(
-            "No se pudo detectar afinación en el audio fuente "
-            "(demasiado ruidoso, polifónico o volumen muy bajo)."
-        )
+    valid = np.where(~np.isnan(f0))[0]
+    if len(valid) == 0:
+        raise RuntimeError("No se pudo detectar pitch (F0) en el audio fuente.")
 
-    last = midi_clean[valid_idx[0]]
-    for i in range(len(midi_clean)):
-        if np.isnan(midi_clean[i]):
-            midi_clean[i] = last
+    # Rellenar NaNs para continuidad (el gate luego decide si suena)
+    f0_clean = f0.copy()
+    last = f0_clean[valid[0]]
+    for i in range(len(f0_clean)):
+        if np.isnan(f0_clean[i]):
+            f0_clean[i] = last
         else:
-            last = midi_clean[i]
+            last = f0_clean[i]
 
-    return midi_clean
+    # Suavizar F0 para evitar “temblor”/vibrato raro
+    f0_clean = one_pole_smooth(f0_clean, alpha=f0_smooth_alpha)
 
+    # Envelope por RMS
+    env = frame_rms(y, frame_length=frame_length, hop_length=hop_length)
+    env = env / (np.max(env) + 1e-12)
 
-def lr_pitch_shift(y: np.ndarray, sr: int, n_steps: float, hop_length: int = HOP_LENGTH) -> np.ndarray:
-    """
-    Pitch shift SIN librosa.effects (evita sklearn).
-    Método: resample (cambia pitch + duración) + phase vocoder (corrige duración).
-    """
-    if n_steps == 0:
-        return y
+    if gate_unvoiced:
+        env = env * voiced.astype(float)
 
-    rate = 2.0 ** (n_steps / 12.0)  # factor de pitch
+    env = one_pole_smooth(env, alpha=env_smooth_alpha)
 
-    # 1) Acelerar (sube pitch) cambiando el "sr efectivo" vía resample a sr/rate
-    target_sr = max(1, int(round(sr / rate)))
-    y_fast = lr_resample(y, orig_sr=sr, target_sr=target_sr)
-
-    # 2) Volver a la duración original sin cambiar pitch usando phase vocoder
-    D = lr_stft(y_fast, hop_length=hop_length)
-    # phase_vocoder rate > 1 acelera; para alargar (desacelerar) usamos 1/rate
-    D_stretch = lr_phase_vocoder(D, rate=1.0 / rate, hop_length=hop_length)
-    y_out = lr_istft(D_stretch, hop_length=hop_length)
-
-    # 3) Ajustar longitud final para que coincida con el input
-    y_out = lr_fix_length(y_out, size=len(y))
-    return y_out
+    return f0_clean, voiced, env
 
 
-def time_varying_pitch_shift(
-    y: np.ndarray,
+def synth_from_f0(
+    f0_frames_hz: np.ndarray,
+    env_frames: np.ndarray,
     sr: int,
-    midi_curve: np.ndarray,
-    base_midi: float = BASE_MIDI,
-    hop_length: int = HOP_LENGTH,
-) -> np.ndarray:
-    """
-    Pitch-shift tiempo-variable usando una curva MIDI.
-    """
-    offsets = midi_curve - base_midi  # semitonos
-    frame_len = hop_length * 4
-    win = np.hanning(frame_len)
+    n_samples: int,
+    frame_length: int,
+    hop_length: int,
+    waveform: str,
+    harmonics: int,
+):
+    f0_frames_hz = np.asarray(f0_frames_hz, float)
+    env_frames = np.asarray(env_frames, float)
 
-    out = np.zeros_like(y, dtype=float)
+    # centros de frame en samples
+    centers = (np.arange(len(f0_frames_hz)) * hop_length + frame_length / 2.0)
+    centers = np.clip(centers, 0, max(0, n_samples - 1))
 
-    for i, semitones in enumerate(offsets):
-        start = i * hop_length
-        end = start + frame_len
-        if end > len(y):
-            break
+    t = np.arange(n_samples, dtype=float)
 
-        frame = y[start:end]
-        shifted = lr_pitch_shift(frame, sr=sr, n_steps=float(semitones), hop_length=hop_length)
+    # Interpolar a nivel sample
+    f0 = np.interp(t, centers, f0_frames_hz)
+    env = np.interp(t, centers, env_frames)
 
-        if len(shifted) > frame_len:
-            shifted = shifted[:frame_len]
-        elif len(shifted) < frame_len:
-            shifted = np.pad(shifted, (0, frame_len - len(shifted)))
+    f0 = np.clip(f0, 1.0, sr / 2.0)
+    phase = np.cumsum(2.0 * np.pi * f0 / sr)
 
-        shifted *= win
-        out[start:end] += shifted
+    if waveform == "sine":
+        sig = np.sin(phase)
 
-    max_abs = np.max(np.abs(out))
-    if max_abs > 0:
-        out = out / max_abs * 0.95
+    elif waveform == "saw":
+        H = max(1, int(harmonics))
+        sig = np.zeros_like(phase)
+        for k in range(1, H + 1):
+            sig += (1.0 / k) * np.sin(k * phase)
+        sig /= (np.max(np.abs(sig)) + 1e-12)
 
-    return out
+    elif waveform == "square":
+        H = max(1, int(harmonics))
+        sig = np.zeros_like(phase)
+        # impares
+        for k in range(1, 2 * H, 2):
+            sig += (1.0 / k) * np.sin(k * phase)
+        sig /= (np.max(np.abs(sig)) + 1e-12)
+
+    else:
+        raise ValueError("waveform debe ser 'sine', 'saw' o 'square'")
+
+    out = sig * env
+    out = np.clip(out, -1.0, 1.0)
+    return out.astype(np.float32, copy=False)
 
 
-# ----------------- WIDGET PARA PLOT DE PITCH -----------------
-
+# ----------------- PLOT -----------------
 
 class PitchPlotCanvas(FigureCanvas):
     def __init__(self, parent=None):
@@ -186,14 +184,12 @@ class PitchPlotCanvas(FigureCanvas):
         self.ax = fig.add_subplot(111)
         super().__init__(fig)
         self.setParent(parent)
-        self.setMinimumHeight(150)
-        self.ax.set_xlabel("Frame")
-        self.ax.set_ylabel("Nota MIDI")
-        self.ax.grid(True, alpha=0.3)
+        self.setMinimumHeight(170)
 
-    def plot_curve(self, midi_curve: np.ndarray):
+    def plot_midi(self, midi_curve: np.ndarray):
         self.ax.clear()
         self.ax.plot(midi_curve, linewidth=1)
+        self.ax.set_title("Curva de afinación (MIDI)")
         self.ax.set_xlabel("Frame")
         self.ax.set_ylabel("Nota MIDI")
         self.ax.grid(True, alpha=0.3)
@@ -204,119 +200,114 @@ class PitchPlotCanvas(FigureCanvas):
         self.draw()
 
 
-# ----------------- WORKER EN HILO SEPARADO -----------------
-
+# ----------------- WORKER -----------------
 
 class AudioWorker(QObject):
     progress = Signal(int)
     log = Signal(str)
     finished = Signal()
     error = Signal(str)
-    pitch_curve = Signal(object)
+    pitch_midi = Signal(object)
 
-    def __init__(self, src_path: str, dst_path: str, out_path: str):
+    def __init__(
+        self,
+        src_path: str,
+        out_path: str,
+        waveform: str,
+        harmonics: int,
+        hop_length: int,
+        frame_length: int,
+        env_alpha: float,
+        f0_alpha: float,
+        gate_unvoiced: bool,
+        output_gain: float,
+    ):
         super().__init__()
         self.src_path = src_path
-        self.dst_path = dst_path
         self.out_path = out_path
+        self.waveform = waveform
+        self.harmonics = harmonics
+        self.hop_length = hop_length
+        self.frame_length = frame_length
+        self.env_alpha = env_alpha
+        self.f0_alpha = f0_alpha
+        self.gate_unvoiced = gate_unvoiced
+        self.output_gain = output_gain
 
     def run(self):
         try:
-            self.log.emit("Iniciando proceso: afinación + envolvente")
+            self.log.emit("Procesando: Pitch map + Envelope → Síntesis")
 
-            self.log.emit("Cargando audio fuente...")
             self.progress.emit(5)
-            src, sr_src = load_mono(self.src_path)
-            self.log.emit(f"  Fuente: {len(src)} muestras, sr = {sr_src} Hz")
+            self.log.emit("Cargando audio fuente...")
+            y, sr = load_mono(self.src_path)
+            self.log.emit(f"  Fuente: {len(y)} samples, sr={sr}")
 
-            self.log.emit("Cargando audio molde (en C)...")
-            self.progress.emit(15)
-            dst, sr_dst = load_mono(self.dst_path)
-            self.log.emit(f"  Molde: {len(dst)} muestras, sr = {sr_dst} Hz")
-
-            if sr_src != sr_dst:
-                self.log.emit(
-                    f"Samplerates distintos (fuente={sr_src}, molde={sr_dst}). "
-                    "Remuestreando molde al de la fuente..."
-                )
-                dst = lr_resample(dst, orig_sr=sr_dst, target_sr=sr_src)
-                sr_dst = sr_src
-                self.log.emit(f"  Nuevo molde: {len(dst)} muestras, sr = {sr_dst} Hz")
-
-            min_len = min(len(src), len(dst))
-            if min_len < len(dst):
-                self.log.emit(
-                    "Recortando molde a la duración de la fuente "
-                    "(ej: molde 55s → se usan primeros 20s)."
-                )
-            src = src[:min_len]
-            dst = dst[:min_len]
-
-            self.log.emit("Calculando envolvente de la fuente (Hilbert)...")
-            self.progress.emit(30)
-            env = compute_envelope(src)
-
-            self.log.emit("Extrayendo curva de pitch (pyin)...")
-            self.progress.emit(50)
-            midi_curve = extract_midi_curve(src, sr_src, hop_length=HOP_LENGTH)
-            self.pitch_curve.emit(midi_curve)
-
-            mean_midi = float(np.mean(midi_curve))
-            std_midi = float(np.std(midi_curve))
-            self.log.emit(f"Curva de pitch: media = {mean_midi:.2f} MIDI, desviación = {std_midi:.2f}")
-
-            self.log.emit("Aplicando curva de pitch al molde...")
-            self.progress.emit(70)
-            pitched = time_varying_pitch_shift(
-                dst, sr_src, midi_curve, base_midi=BASE_MIDI, hop_length=HOP_LENGTH
+            self.progress.emit(25)
+            self.log.emit("Extrayendo F0/voicing + envelope (RMS)...")
+            f0_frames, voiced, env_frames = extract_pitch_voicing_and_env(
+                y=y,
+                sr=sr,
+                frame_length=self.frame_length,
+                hop_length=self.hop_length,
+                env_smooth_alpha=self.env_alpha,
+                f0_smooth_alpha=self.f0_alpha,
+                gate_unvoiced=self.gate_unvoiced,
             )
 
-            self.log.emit("Aplicando envolvente de la fuente al molde afinado...")
-            self.progress.emit(85)
-            out = apply_envelope(pitched, env, safety_gain=0.5)
+            midi_frames = lr_hz_to_midi(f0_frames)
+            self.pitch_midi.emit(midi_frames)
 
-            self.log.emit(f"Guardando resultado en: {self.out_path}")
+            self.progress.emit(60)
+            self.log.emit("Sintetizando señal...")
+            out = synth_from_f0(
+                f0_frames_hz=f0_frames,
+                env_frames=env_frames,
+                sr=sr,
+                n_samples=len(y),
+                frame_length=self.frame_length,
+                hop_length=self.hop_length,
+                waveform=self.waveform,
+                harmonics=self.harmonics,
+            )
+
+            self.progress.emit(80)
+            if self.output_gain != 1.0:
+                out = np.clip(out * float(self.output_gain), -1.0, 1.0)
+
+            self.log.emit(f"Guardando WAV: {self.out_path}")
             self.progress.emit(95)
-            sf.write(self.out_path, out, sr_src)
+            sf.write(self.out_path, out, sr)
 
             self.progress.emit(100)
-            self.log.emit("Proceso completado (afinación + envolvente).")
+            self.log.emit("Listo.")
             self.finished.emit()
 
         except Exception as e:
             self.error.emit(str(e))
 
 
-# ----------------- VENTANA PRINCIPAL -----------------
-
+# ----------------- UI -----------------
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-
-        self.setWindowTitle("Copiador de Envolvente + Afinación")
-        self.resize(900, 600)
+        self.setWindowTitle("Pitch+Envelope Synth (sin sklearn)")
+        self.resize(980, 680)
 
         central = QWidget()
         self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(10)
 
-        main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(15, 15, 15, 15)
-        main_layout.setSpacing(10)
-
-        mode_label = QLabel("Modo: Copiar afinación (portamento) + envolvente en un solo paso")
-        main_layout.addWidget(mode_label)
-
+        # Paths
         self.src_edit = QLineEdit()
-        self.dst_edit = QLineEdit()
         self.out_edit = QLineEdit()
 
         btn_src = QPushButton("Examinar…")
-        btn_dst = QPushButton("Examinar…")
         btn_out = QPushButton("Guardar como…")
-
         btn_src.clicked.connect(self.browse_src)
-        btn_dst.clicked.connect(self.browse_dst)
         btn_out.clicked.connect(self.browse_out)
 
         row_src = QHBoxLayout()
@@ -324,100 +315,162 @@ class MainWindow(QMainWindow):
         row_src.addWidget(self.src_edit)
         row_src.addWidget(btn_src)
 
-        row_dst = QHBoxLayout()
-        row_dst.addWidget(QLabel("Audio molde (en C):"))
-        row_dst.addWidget(self.dst_edit)
-        row_dst.addWidget(btn_dst)
-
         row_out = QHBoxLayout()
-        row_out.addWidget(QLabel("Audio de salida:"))
+        row_out.addWidget(QLabel("Salida WAV:"))
         row_out.addWidget(self.out_edit)
         row_out.addWidget(btn_out)
 
-        main_layout.addLayout(row_src)
-        main_layout.addLayout(row_dst)
-        main_layout.addLayout(row_out)
+        layout.addLayout(row_src)
+        layout.addLayout(row_out)
 
-        self.process_button = QPushButton("Procesar (afinación + envolvente)")
-        self.process_button.clicked.connect(self.start_processing)
-        main_layout.addWidget(self.process_button)
+        # Controls
+        controls = QHBoxLayout()
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        main_layout.addWidget(self.progress_bar)
+        self.wave_combo = QComboBox()
+        self.wave_combo.addItems(["sine", "saw", "square"])
+
+        self.harm_spin = QSpinBox()
+        self.harm_spin.setRange(1, 64)
+        self.harm_spin.setValue(12)
+
+        self.hop_spin = QSpinBox()
+        self.hop_spin.setRange(64, 4096)
+        self.hop_spin.setSingleStep(64)
+        self.hop_spin.setValue(DEFAULT_HOP_LENGTH)
+
+        self.env_alpha = QDoubleSpinBox()
+        self.env_alpha.setRange(0.01, 1.0)
+        self.env_alpha.setSingleStep(0.05)
+        self.env_alpha.setValue(0.25)
+
+        self.f0_alpha = QDoubleSpinBox()
+        self.f0_alpha.setRange(0.01, 1.0)
+        self.f0_alpha.setSingleStep(0.05)
+        self.f0_alpha.setValue(0.20)
+
+        self.gate_check = QCheckBox("Mutear unvoiced")
+        self.gate_check.setChecked(True)
+
+        self.gain_spin = QDoubleSpinBox()
+        self.gain_spin.setRange(0.1, 3.0)
+        self.gain_spin.setSingleStep(0.1)
+        self.gain_spin.setValue(1.0)
+
+        controls.addWidget(QLabel("Wave:"))
+        controls.addWidget(self.wave_combo)
+        controls.addSpacing(10)
+
+        controls.addWidget(QLabel("Armónicos:"))
+        controls.addWidget(self.harm_spin)
+        controls.addSpacing(10)
+
+        controls.addWidget(QLabel("Hop:"))
+        controls.addWidget(self.hop_spin)
+        controls.addSpacing(10)
+
+        controls.addWidget(QLabel("Env α:"))
+        controls.addWidget(self.env_alpha)
+        controls.addSpacing(10)
+
+        controls.addWidget(QLabel("F0 α:"))
+        controls.addWidget(self.f0_alpha)
+        controls.addSpacing(10)
+
+        controls.addWidget(self.gate_check)
+        controls.addSpacing(10)
+
+        controls.addWidget(QLabel("Gain:"))
+        controls.addWidget(self.gain_spin)
+
+        controls.addStretch()
+        layout.addLayout(controls)
+
+        # Process button
+        self.btn_process = QPushButton("Procesar (sintetizar)")
+        self.btn_process.clicked.connect(self.start_processing)
+        layout.addWidget(self.btn_process)
+
+        # Progress + Plot + Logs
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        layout.addWidget(self.progress)
 
         self.pitch_canvas = PitchPlotCanvas(self)
-        main_layout.addWidget(self.pitch_canvas)
+        layout.addWidget(self.pitch_canvas)
 
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        main_layout.addWidget(self.log_text, stretch=1)
+        self.logs = QTextEdit()
+        self.logs.setReadOnly(True)
+        layout.addWidget(self.logs, stretch=1)
 
-        main_layout.addItem(QSpacerItem(0, 10, QSizePolicy.Minimum, QSizePolicy.Expanding))
-
-        self.footer_label = QLabel("© 2025 Gabriel Golker")
-        self.footer_label.setAlignment(Qt.AlignCenter)
-        main_layout.addWidget(self.footer_label)
+        layout.addItem(QSpacerItem(0, 10, QSizePolicy.Minimum, QSizePolicy.Expanding))
+        footer = QLabel("© 2025 Gabriel Golker")
+        footer.setAlignment(Qt.AlignCenter)
+        layout.addWidget(footer)
 
         self.thread = None
         self.worker = None
 
     def browse_src(self):
         path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Seleccionar audio fuente",
-            "",
-            "Audio files (*.wav *.flac *.ogg *.mp3);;Todos los archivos (*.*)",
+            self, "Seleccionar audio fuente", "", "Audio files (*.wav *.flac *.ogg *.mp3);;Todos (*.*)"
         )
         if path:
             self.src_edit.setText(path)
 
-    def browse_dst(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Seleccionar audio molde (en C)",
-            "",
-            "Audio files (*.wav *.flac *.ogg *.mp3);;Todos los archivos (*.*)",
-        )
-        if path:
-            self.dst_edit.setText(path)
-
     def browse_out(self):
         path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Seleccionar archivo de salida",
-            "resultado.wav",
-            "Archivos WAV (*.wav);;Todos los archivos (*.*)",
+            self, "Guardar salida", "resultado.wav", "WAV (*.wav);;Todos (*.*)"
         )
         if path:
             self.out_edit.setText(path)
 
-    def start_processing(self):
-        src_path = self.src_edit.text().strip()
-        dst_path = self.dst_edit.text().strip()
-        out_path = self.out_edit.text().strip()
+    def log(self, msg: str):
+        self.logs.append(msg)
 
-        if not src_path or not dst_path or not out_path:
-            QMessageBox.warning(self, "Campos incompletos", "Completa todas las rutas de archivo.")
+    def start_processing(self):
+        src = self.src_edit.text().strip()
+        outp = self.out_edit.text().strip()
+
+        if not src or not outp:
+            QMessageBox.warning(self, "Falta info", "Selecciona audio fuente y ruta de salida.")
             return
 
-        self.log_text.clear()
-        self.progress_bar.setValue(0)
-        self.pitch_canvas.clear_plot()
+        wave = self.wave_combo.currentText()
+        harm = int(self.harm_spin.value())
+        hop = int(self.hop_spin.value())
+        frame_length = DEFAULT_FRAME_LENGTH
+        env_a = float(self.env_alpha.value())
+        f0_a = float(self.f0_alpha.value())
+        gate = bool(self.gate_check.isChecked())
+        gain = float(self.gain_spin.value())
 
-        self.process_button.setEnabled(False)
+        self.logs.clear()
+        self.pitch_canvas.clear_plot()
+        self.progress.setValue(0)
+        self.btn_process.setEnabled(False)
 
         self.thread = QThread()
-        self.worker = AudioWorker(src_path, dst_path, out_path)
+        self.worker = AudioWorker(
+            src_path=src,
+            out_path=outp,
+            waveform=wave,
+            harmonics=harm,
+            hop_length=hop,
+            frame_length=frame_length,
+            env_alpha=env_a,
+            f0_alpha=f0_a,
+            gate_unvoiced=gate,
+            output_gain=gain,
+        )
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.run)
-        self.worker.progress.connect(self.progress_bar.setValue)
-        self.worker.log.connect(self.append_log)
-        self.worker.finished.connect(self.on_finished)
-        self.worker.error.connect(self.on_error)
-        self.worker.pitch_curve.connect(self.on_pitch_curve)
+        self.worker.progress.connect(self.progress.setValue)
+        self.worker.log.connect(self.log)
+        self.worker.pitch_midi.connect(lambda arr: self.pitch_canvas.plot_midi(np.array(arr)))
+        self.worker.finished.connect(self.on_done)
+        self.worker.error.connect(self.on_err)
 
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
@@ -428,29 +481,22 @@ class MainWindow(QMainWindow):
 
         self.thread.start()
 
-    def append_log(self, text: str):
-        self.log_text.append(text)
+    def on_done(self):
+        self.btn_process.setEnabled(True)
+        QMessageBox.information(self, "Listo", "Audio sintetizado correctamente.")
 
-    def on_finished(self):
-        self.process_button.setEnabled(True)
-        QMessageBox.information(self, "Listo", "Proceso completado correctamente.")
-
-    def on_error(self, message: str):
-        self.process_button.setEnabled(True)
-        QMessageBox.critical(self, "Error", f"Ocurrió un error:\n{message}")
-        self.append_log(f"ERROR: {message}")
-
-    def on_pitch_curve(self, midi_curve):
-        self.pitch_canvas.plot_curve(np.array(midi_curve))
+    def on_err(self, msg: str):
+        self.btn_process.setEnabled(True)
+        self.log(f"ERROR: {msg}")
+        QMessageBox.critical(self, "Error", msg)
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-
     import qdarkstyle
     app.setStyleSheet(qdarkstyle.load_stylesheet(qt_api="pyside6"))
 
-    window = MainWindow()
-    window.show()
+    w = MainWindow()
+    w.show()
     sys.exit(app.exec())
 
